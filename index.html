@@ -2166,7 +2166,8 @@ function framingState(lm, opts = {}) {
   if (!lm || lm.length < 33) {
     return { state: 'NONE', msg: 'NO POSE',
              title: 'STEP INTO FRAME',
-             body: 'Step into the camera view. The pose model will lock on once your body is detected.' };
+             body: 'Step into the camera view. The pose model will lock on once your body is detected.',
+             debug: { h: 0, cx: 0.5, vLH: 0, vRH: 0, vLK: 0, vRK: 0 } };
   }
   const v = (i) => (lm[i]?.visibility ?? 0);
   const headVis    = v(0) > 0.4;
@@ -2178,32 +2179,8 @@ function framingState(lm, opts = {}) {
                      sideVisible(lm, LM.R_HIP, LM.R_KNEE, 0.4);
   const anklesVis  = v(27) > 0.4 || v(28) > 0.4;
 
-  if (!hipsVis || !kneesVis || !legVis) {
-    return { state: 'BAD', msg: 'POSE INCOMPLETE',
-             title: 'FULL BODY NEEDED',
-             body: 'Move into frame so one full leg (hip and knee on the same side) is clearly visible.' };
-  }
-  // Head/ankle gates are skipped for movements (like wall ball) whose
-  // calibration only needs hip+knee. The diagnostic dots still show the user
-  // when head/ankle are out of frame so they can adjust if they want.
-  if (!opts.skipHeadAnkle) {
-    if (!headVis && !anklesVis) {
-      return { state: 'BAD', msg: 'HEAD AND FEET MISSING',
-               title: 'FRAME YOUR FULL BODY',
-               body: 'Step back so both your head and your ankles fit inside the frame.' };
-    }
-    if (!headVis) {
-      return { state: 'BAD', msg: 'HEAD CLIPPED',
-               title: 'TILT PHONE UP',
-               body: 'Tilt the phone upward or step back so the top of your head is in frame.' };
-    }
-    if (!anklesVis) {
-      return { state: 'BAD', msg: 'ANKLES CLIPPED',
-               title: 'TILT PHONE DOWN',
-               body: 'Tilt the phone downward or step back so your ankles are in frame.' };
-    }
-  }
-  // Bounding box from visible landmarks (image-space, 0..1)
+  // Bounding box from visible landmarks (image-space, 0..1) — computed early
+  // so it's available to every return path's debug readout.
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (const l of lm) {
     if ((l.visibility ?? 0) < 0.4) continue;
@@ -2212,8 +2189,40 @@ function framingState(lm, opts = {}) {
     if (l.y < minY) minY = l.y;
     if (l.y > maxY) maxY = l.y;
   }
-  const heightFrac = maxY - minY;
-  const centerX = (minX + maxX) / 2;
+  const heightFrac = (isFinite(minY) && isFinite(maxY)) ? (maxY - minY) : 0;
+  const centerX = (isFinite(minX) && isFinite(maxX)) ? (minX + maxX) / 2 : 0.5;
+  const debug = { h: heightFrac, cx: centerX,
+                  vLH: v(23), vRH: v(24), vLK: v(25), vRK: v(26) };
+
+  if (!hipsVis || !kneesVis || !legVis) {
+    return { state: 'BAD', msg: 'POSE INCOMPLETE',
+             title: 'FULL BODY NEEDED',
+             body: 'Move into frame so one full leg (hip and knee on the same side) is clearly visible.',
+             debug };
+  }
+  // Head/ankle gates are skipped for movements (like wall ball) whose
+  // calibration only needs hip+knee. The diagnostic dots still show the user
+  // when head/ankle are out of frame so they can adjust if they want.
+  if (!opts.skipHeadAnkle) {
+    if (!headVis && !anklesVis) {
+      return { state: 'BAD', msg: 'HEAD AND FEET MISSING',
+               title: 'FRAME YOUR FULL BODY',
+               body: 'Step back so both your head and your ankles fit inside the frame.',
+               debug };
+    }
+    if (!headVis) {
+      return { state: 'BAD', msg: 'HEAD CLIPPED',
+               title: 'TILT PHONE UP',
+               body: 'Tilt the phone upward or step back so the top of your head is in frame.',
+               debug };
+    }
+    if (!anklesVis) {
+      return { state: 'BAD', msg: 'ANKLES CLIPPED',
+               title: 'TILT PHONE DOWN',
+               body: 'Tilt the phone downward or step back so your ankles are in frame.',
+               debug };
+    }
+  }
 
   // Thresholds loosened for the real wall-ball setup: phone in portrait at
   // 4–5 m means the athlete fills ~30–40% of the (landscape) source-frame
@@ -2222,26 +2231,31 @@ function framingState(lm, opts = {}) {
   if (heightFrac < 0.25) {
     return { state: 'WARN', msg: 'TOO FAR',
              title: 'STEP FORWARD',
-             body: 'You\'re very small in frame. Move closer or position the phone further away.' };
+             body: 'You\'re very small in frame. Move closer or position the phone further away.',
+             debug };
   }
   if (heightFrac > 0.97) {
     return { state: 'WARN', msg: 'TOO CLOSE',
              title: 'STEP BACK',
-             body: 'You\'re filling the frame edge-to-edge. Step back a half-step.' };
+             body: 'You\'re filling the frame edge-to-edge. Step back a half-step.',
+             debug };
   }
   if (centerX < 0.12) {
     return { state: 'WARN', msg: 'OFF-CENTER',
              title: 'SHIFT RIGHT',
-             body: 'Move right so you\'re centered horizontally in the frame.' };
+             body: 'Move right so you\'re centered horizontally in the frame.',
+             debug };
   }
   if (centerX > 0.88) {
     return { state: 'WARN', msg: 'OFF-CENTER',
              title: 'SHIFT LEFT',
-             body: 'Move left so you\'re centered horizontally in the frame.' };
+             body: 'Move left so you\'re centered horizontally in the frame.',
+             debug };
   }
   return { state: 'LOCKED', msg: 'POSE LOCKED',
            title: 'HOLD STILL',
-           body: 'Recording your standing baseline. Don\'t move.' };
+           body: 'Recording your standing baseline. Don\'t move.',
+           debug };
 }
 
 // ============================
@@ -2389,8 +2403,16 @@ function calibrateLoop() {
         const frame = framingState(lm, { skipHeadAnkle: true });
         const isLocked = frame.state === 'LOCKED' && wlm;
 
+        // Compact debug readout (e.g. "h:0.32 cx:0.50 · LH:.71 RH:.22 LK:.68 RK:.18")
+        // so the user can see exactly which gate is firing without DevTools.
+        const d = frame.debug || {};
+        const fmtV = x => (x ?? 0).toFixed(2).slice(1); // ".71"
+        const dbgStr = `h:${(d.h ?? 0).toFixed(2)} cx:${(d.cx ?? 0).toFixed(2)} · ` +
+                       `LH:${fmtV(d.vLH)} RH:${fmtV(d.vRH)} LK:${fmtV(d.vLK)} RK:${fmtV(d.vRK)}`;
+
         if (isLocked) {
-          calQuality.innerHTML = "<span class='ok'>● " + frame.msg + "</span>";
+          calQuality.innerHTML = "<span class='ok'>● " + frame.msg + "</span>" +
+                                 "<br><span style='opacity:0.6;font-size:9px;'>" + dbgStr + "</span>";
 
           // FPS probe runs only during pre-capture framing.
           if (calStartMs === 0) maybeAutoDowngrade(ts);
@@ -2433,7 +2455,8 @@ function calibrateLoop() {
           calProgress.style.width = "0%";
           calSampleBuf = [];
           const cls = frame.state === 'WARN' ? 'warn' : 'bad';
-          calQuality.innerHTML = `<span class='${cls}'>● ${frame.msg}</span>`;
+          calQuality.innerHTML = `<span class='${cls}'>● ${frame.msg}</span>` +
+                                 `<br><span style='opacity:0.6;font-size:9px;'>${dbgStr}</span>`;
           calInstrTitle.textContent = frame.title;
           calInstrBody.textContent = frame.body;
         }
