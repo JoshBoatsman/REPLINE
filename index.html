@@ -1405,7 +1405,7 @@
       <div class="setting-hint">HOW FAR HIP MUST DROP BELOW KNEE (CM)</div>
     </div>
     <div class="setting-slider">
-      <input type="range" id="depthSlider" min="-3" max="8" step="1" value="0" />
+      <input type="range" id="depthSlider" min="-3" max="8" step="1" value="-2" />
       <span class="slider-value" id="depthValue">0 cm</span>
     </div>
   </div>
@@ -1416,7 +1416,7 @@
       <div class="setting-hint">% OF STANDING BASELINE TO RESET REP</div>
     </div>
     <div class="setting-slider">
-      <input type="range" id="standSlider" min="60" max="95" step="5" value="80" />
+      <input type="range" id="standSlider" min="60" max="95" step="5" value="70" />
       <span class="slider-value" id="standValue">80%</span>
     </div>
   </div>
@@ -1502,10 +1502,14 @@ const ATHLETES_KEY = "hyrox_vision_v1_6_athletes"; // current
 // ============================
 const settings = {
   // depthOffset: cm. Positive = stricter (require hip further below knee).
-  // 0 = the model's worldLandmarks knee.y crosses zero (hip below knee by 0).
-  depthOffsetCm: 0,
-  // Standing reset threshold (% of standing baseline)
-  standPct: 0.80,
+  // 0 = parallel (hip level with knee). -2 default gives a 2 cm grace zone
+  // for pose noise on borderline reps — athletes wanting strict Hyrox
+  // judging can slide back up to 0 or higher.
+  depthOffsetCm: -2,
+  // Standing reset threshold (% of standing baseline). 0.70 is the middle of
+  // the 60–95% slider range — 0.80 was the strictest valid setting and missed
+  // reps from fatigued athletes who never re-lock the knees between reps.
+  standPct: 0.70,
   // Motion dead zone in m/s (5 cm/s default)
   deadZoneMs: 0.05,
   audioOn: true,
@@ -1515,15 +1519,18 @@ const settings = {
 // ============================
 // ATHLETES (persisted) + ACTIVE
 // ============================
-// Each athlete: { id, name, standingKneeY, axisSign, ts }
+// Each athlete: { id, name, standingKneeY, ts }
+// standingKneeY is always stored as a positive magnitude in meters (the
+// absolute hip-to-knee Y delta when standing tall). MediaPipe worldLandmarks
+// are documented y-down, so signed depth = knee.y - hip.y goes positive→zero→
+// negative as the athlete squats. We no longer infer an axis sign from a
+// single calibration sample — it was a silent-failure surface.
 let athletes = [];
 let activeAthlete = null;
 
 // `calibration` is a snapshot of the active athlete used by the judge loop.
-// We keep it as a plain object so existing code paths don't change.
 const calibration = {
   standingKneeY: null,
-  axisSign: 1,
   ts: null,
 };
 
@@ -1539,6 +1546,9 @@ function loadAthletes() {
   } catch (e) { /* ignore */ }
 
   // Soft-migrate any V1.5 single calibration into an "Athlete 1" record.
+  // Older records may have been stored signed (positive or negative depending
+  // on axisSign at the time); take Math.abs so the new positive-magnitude
+  // convention holds.
   if (athletes.length === 0) {
     try {
       const legacy = localStorage.getItem(CAL_KEY_V15);
@@ -1548,14 +1558,19 @@ function loadAthletes() {
           athletes.push({
             id: "legacy-" + Date.now(),
             name: "Athlete 1",
-            standingKneeY: p.standingKneeY,
-            axisSign: p.axisSign || (p.standingKneeY > 0 ? 1 : -1),
+            standingKneeY: Math.abs(p.standingKneeY),
             ts: p.ts || Date.now(),
           });
           saveAthletes();
         }
       }
     } catch (e) {}
+  }
+  // Normalize any pre-existing athletes that were stored with signed values
+  // (and may carry a now-defunct axisSign). Strip the field and force abs.
+  for (const a of athletes) {
+    if (typeof a.standingKneeY === "number") a.standingKneeY = Math.abs(a.standingKneeY);
+    if ("axisSign" in a) delete a.axisSign;
   }
 }
 
@@ -1569,7 +1584,6 @@ function addAthlete(name) {
     id: "ath-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
     name: name.trim().slice(0, 24),
     standingKneeY: null,
-    axisSign: 1,
     ts: null,
   };
   athletes.push(a);
@@ -1583,7 +1597,6 @@ function deleteAthlete(id) {
   if (activeAthlete && activeAthlete.id === id) {
     activeAthlete = null;
     calibration.standingKneeY = null;
-    calibration.axisSign = 1;
     calibration.ts = null;
   }
 }
@@ -1591,7 +1604,6 @@ function deleteAthlete(id) {
 function activateAthlete(athlete) {
   activeAthlete = athlete;
   calibration.standingKneeY = athlete.standingKneeY;
-  calibration.axisSign = athlete.axisSign;
   calibration.ts = athlete.ts;
   // Track last-used time
   athlete.lastUsed = Date.now();
@@ -1604,7 +1616,6 @@ function activateAthlete(athlete) {
 function persistActiveCalibration() {
   if (!activeAthlete) return;
   activeAthlete.standingKneeY = calibration.standingKneeY;
-  activeAthlete.axisSign = calibration.axisSign;
   activeAthlete.ts = calibration.ts;
   saveAthletes();
 }
@@ -1621,13 +1632,18 @@ const session = {
   repStartTime: 0,
   achievedDepth: false,
   peakKneeY: null,        // deepest reading during current rep (most negative for y-down)
+  wasAscending: false,    // saw clear positive ascent velocity this rep — used to commit at the top of the ascent
   paused: false,
   noVisFrames: 0,
   angles: null,           // latest computed joint angles
 };
 
 const MIN_REP_DURATION_MS = 600;
-const VIS_RESET_FRAMES = 8;
+// Brief vis loss is normal mid-rep (wrist crosses far hip, arms occlude leg on
+// the throw). Tolerate ~660ms before resetting an in-progress rep that never
+// hit depth. Reps that already achieved depth are held until the next visible
+// stand-up.
+const VIS_RESET_FRAMES = 20;
 
 // Smoothing on key world-space signals
 const smoothed = {
@@ -1846,6 +1862,16 @@ function sizeOverlay(videoEl, overlayEl) {
   overlayEl.height = videoEl.videoHeight || 1280;
 }
 
+// Resolves once the video has reported its intrinsic dimensions. Without this
+// guard, sizing the overlay right after camera flip can read 0×0 and leave the
+// rep line misaligned with the on-screen knee.
+function awaitVideoMetadata(videoEl) {
+  if (videoEl.videoWidth > 0 && videoEl.videoHeight > 0) return Promise.resolve();
+  return new Promise(resolve => {
+    videoEl.addEventListener("loadedmetadata", () => resolve(), { once: true });
+  });
+}
+
 window.addEventListener("resize", () => {
   if (appEl.style.display !== "none") sizeOverlay(video, overlay);
   if (calibrateEl.classList.contains("show")) sizeOverlay(calVideo, calOverlay);
@@ -1865,6 +1891,7 @@ async function flipCamera() {
   const targetVideo = calibrateEl.classList.contains("show") ? calVideo : video;
   try {
     await startCamera(targetVideo);
+    await awaitVideoMetadata(targetVideo);
     cameraReady = true;
     if (calibrateEl.classList.contains("show")) sizeOverlay(calVideo, calOverlay);
     else if (appEl.style.display !== "none")    sizeOverlay(video, overlay);
@@ -1915,6 +1942,24 @@ async function loadModel(variant = currentModelVariant) {
 // ============================
 function avg(a, b) { return (a + b) / 2; }
 function ema(prev, next, alpha) { return prev * (1 - alpha) + next * alpha; }
+
+// Side-view friendly Y picker. From a side view one of L/R is almost always
+// occluded — averaging a high-confidence point with a low-confidence one drags
+// the signal toward noise. Prefer the more-visible side; only average when both
+// are confident.
+function bestY(lm, leftIdx, rightIdx) {
+  const L = lm[leftIdx], R = lm[rightIdx];
+  const vL = L && (L.visibility ?? 0), vR = R && (R.visibility ?? 0);
+  if (vL >= 0.6 && vR >= 0.6) return (L.y + R.y) / 2;
+  if (vL >= vR && L) return L.y;
+  if (R) return R.y;
+  return L ? L.y : 0;
+}
+// True if at least one side (L_HIP+L_KNEE or R_HIP+R_KNEE) is confidently visible.
+function sideVisible(lm, hipIdx, kneeIdx, thresh = 0.5) {
+  const h = lm[hipIdx], k = lm[kneeIdx];
+  return h && k && (h.visibility ?? 0) >= thresh && (k.visibility ?? 0) >= thresh;
+}
 
 // One-Euro filter (Casiez et al.) — adaptive low-pass that's responsive at high
 // speed and smooth at rest. Replaces fixed-α EMA on the depth signal so lateral
@@ -1976,7 +2021,10 @@ function angle3D(a, b, c) {
 
 // Compute the named angles every movement rule can reference.
 // 180° = limb fully extended/locked, smaller = more flexed.
+// Per-side angles are tagged with their weakest landmark visibility so
+// consumers can pick the trustworthy side in side-view setups.
 function computeAngles(wlm) {
+  const vMin = (...ids) => Math.min(...ids.map(i => wlm[i]?.visibility ?? 0));
   const a = {
     kneeL:  angle3D(wlm[LM.L_HIP],      wlm[LM.L_KNEE],  wlm[LM.L_ANKLE]),
     kneeR:  angle3D(wlm[LM.R_HIP],      wlm[LM.R_KNEE],  wlm[LM.R_ANKLE]),
@@ -1984,11 +2032,29 @@ function computeAngles(wlm) {
     hipR:   angle3D(wlm[LM.R_SHOULDER], wlm[LM.R_HIP],   wlm[LM.R_KNEE]),
     elbowL: angle3D(wlm[LM.L_SHOULDER], wlm[LM.L_ELBOW], wlm[LM.L_WRIST]),
     elbowR: angle3D(wlm[LM.R_SHOULDER], wlm[LM.R_ELBOW], wlm[LM.R_WRIST]),
+    kneeLvis: vMin(LM.L_HIP, LM.L_KNEE, LM.L_ANKLE),
+    kneeRvis: vMin(LM.R_HIP, LM.R_KNEE, LM.R_ANKLE),
   };
   // Symmetric means for movements where left/right are equivalent.
   a.knee  = (a.kneeL  + a.kneeR)  / 2;
   a.hip   = (a.hipL   + a.hipR)   / 2;
   a.elbow = (a.elbowL + a.elbowR) / 2;
+  // Best-side knee: prefer the more-visible leg, fall back to mean when both
+  // are confident. Used by angle-based movements (air squat, lunge) so an
+  // occluded back leg doesn't poison the rule.
+  const VIS_OK = 0.5;
+  if (a.kneeLvis >= VIS_OK && a.kneeRvis >= VIS_OK) {
+    a.kneeBest = a.knee;
+  } else if (a.kneeLvis >= a.kneeRvis) {
+    a.kneeBest = a.kneeL;
+  } else {
+    a.kneeBest = a.kneeR;
+  }
+  // For lunge: the front (more-flexed) knee, but only among sides we trust.
+  const candidates = [];
+  if (a.kneeLvis >= VIS_OK) candidates.push(a.kneeL);
+  if (a.kneeRvis >= VIS_OK) candidates.push(a.kneeR);
+  a.kneeFront = candidates.length ? Math.min(...candidates) : a.kneeBest;
   // Asymmetry — useful as a future fatigue/form signal.
   a.kneeAsymmetry = Math.abs(a.kneeL - a.kneeR);
   return a;
@@ -2055,8 +2121,8 @@ const MOVEMENTS = {
     repLineLandmark:   null,
     indicatorLandmark: null,
     requiresCalibration: false,
-    signal:         (ctx) => ctx.angles ? ctx.angles.knee : 180,
-    signalDisplay:  (ctx) => ctx.angles ? ctx.angles.knee.toFixed(0) : "—",
+    signal:         (ctx) => ctx.angles ? ctx.angles.kneeBest : 180,
+    signalDisplay:  (ctx) => ctx.angles ? ctx.angles.kneeBest.toFixed(0) : "—",
     depthThreshold: ()    => 95,
     standThreshold: ()    => 165,
     velocityDeadZone: ()  => 15,        // deg/s
@@ -2077,9 +2143,9 @@ const MOVEMENTS = {
     repLineLandmark:   null,
     indicatorLandmark: null,
     requiresCalibration: false,
-    // Signal is the more-flexed (front) knee.
-    signal:         (ctx) => ctx.angles ? Math.min(ctx.angles.kneeL, ctx.angles.kneeR) : 180,
-    signalDisplay:  (ctx) => ctx.angles ? Math.min(ctx.angles.kneeL, ctx.angles.kneeR).toFixed(0) : "—",
+    // Signal is the more-flexed (front) knee, picked only among trusted sides.
+    signal:         (ctx) => ctx.angles ? ctx.angles.kneeFront : 180,
+    signalDisplay:  (ctx) => ctx.angles ? ctx.angles.kneeFront.toFixed(0) : "—",
     depthThreshold: ()    => 95,
     standThreshold: ()    => 160,
     velocityDeadZone: ()  => 15,
@@ -2096,7 +2162,7 @@ let activeMovement = MOVEMENTS.wall_ball;
 // ============================
 // Given image-space landmarks, classify how well the athlete is framed.
 // Drives the calibration screen with actionable guidance instead of binary OK/NOT-OK.
-function framingState(lm) {
+function framingState(lm, opts = {}) {
   if (!lm || lm.length < 33) {
     return { state: 'NONE', msg: 'NO POSE',
              title: 'STEP INTO FRAME',
@@ -2104,29 +2170,38 @@ function framingState(lm) {
   }
   const v = (i) => (lm[i]?.visibility ?? 0);
   const headVis    = v(0) > 0.4;
-  const hipsVis    = v(23) > 0.4 && v(24) > 0.4;
-  const kneesVis   = v(25) > 0.4 && v(26) > 0.4;
+  // Side view occludes one side of the body almost by definition. Require only
+  // one hip + one knee (and let the same-side check enforce a usable leg).
+  const hipsVis    = v(23) > 0.4 || v(24) > 0.4;
+  const kneesVis   = v(25) > 0.4 || v(26) > 0.4;
+  const legVis     = sideVisible(lm, LM.L_HIP, LM.L_KNEE, 0.4) ||
+                     sideVisible(lm, LM.R_HIP, LM.R_KNEE, 0.4);
   const anklesVis  = v(27) > 0.4 || v(28) > 0.4;
 
-  if (!hipsVis || !kneesVis) {
+  if (!hipsVis || !kneesVis || !legVis) {
     return { state: 'BAD', msg: 'POSE INCOMPLETE',
              title: 'FULL BODY NEEDED',
-             body: 'Move into frame so your hips and knees are clearly visible to the camera.' };
+             body: 'Move into frame so one full leg (hip and knee on the same side) is clearly visible.' };
   }
-  if (!headVis && !anklesVis) {
-    return { state: 'BAD', msg: 'HEAD AND FEET MISSING',
-             title: 'FRAME YOUR FULL BODY',
-             body: 'Step back so both your head and your ankles fit inside the frame.' };
-  }
-  if (!headVis) {
-    return { state: 'BAD', msg: 'HEAD CLIPPED',
-             title: 'TILT PHONE UP',
-             body: 'Tilt the phone upward or step back so the top of your head is in frame.' };
-  }
-  if (!anklesVis) {
-    return { state: 'BAD', msg: 'ANKLES CLIPPED',
-             title: 'TILT PHONE DOWN',
-             body: 'Tilt the phone downward or step back so your ankles are in frame.' };
+  // Head/ankle gates are skipped for movements (like wall ball) whose
+  // calibration only needs hip+knee. The diagnostic dots still show the user
+  // when head/ankle are out of frame so they can adjust if they want.
+  if (!opts.skipHeadAnkle) {
+    if (!headVis && !anklesVis) {
+      return { state: 'BAD', msg: 'HEAD AND FEET MISSING',
+               title: 'FRAME YOUR FULL BODY',
+               body: 'Step back so both your head and your ankles fit inside the frame.' };
+    }
+    if (!headVis) {
+      return { state: 'BAD', msg: 'HEAD CLIPPED',
+               title: 'TILT PHONE UP',
+               body: 'Tilt the phone upward or step back so the top of your head is in frame.' };
+    }
+    if (!anklesVis) {
+      return { state: 'BAD', msg: 'ANKLES CLIPPED',
+               title: 'TILT PHONE DOWN',
+               body: 'Tilt the phone downward or step back so your ankles are in frame.' };
+    }
   }
   // Bounding box from visible landmarks (image-space, 0..1)
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -2140,22 +2215,26 @@ function framingState(lm) {
   const heightFrac = maxY - minY;
   const centerX = (minX + maxX) / 2;
 
-  if (heightFrac < 0.55) {
+  // Thresholds loosened for the real wall-ball setup: phone in portrait at
+  // 4–5 m means the athlete fills ~30–40% of the (landscape) source-frame
+  // height even though they fill the screen visually. The pose model works
+  // fine far below 55%; only flag *unusable* extremes.
+  if (heightFrac < 0.25) {
     return { state: 'WARN', msg: 'TOO FAR',
              title: 'STEP FORWARD',
-             body: 'You\'re too small in frame. Move closer or position the phone further away.' };
+             body: 'You\'re very small in frame. Move closer or position the phone further away.' };
   }
   if (heightFrac > 0.97) {
     return { state: 'WARN', msg: 'TOO CLOSE',
              title: 'STEP BACK',
              body: 'You\'re filling the frame edge-to-edge. Step back a half-step.' };
   }
-  if (centerX < 0.28) {
+  if (centerX < 0.12) {
     return { state: 'WARN', msg: 'OFF-CENTER',
              title: 'SHIFT RIGHT',
              body: 'Move right so you\'re centered horizontally in the frame.' };
   }
-  if (centerX > 0.72) {
+  if (centerX > 0.88) {
     return { state: 'WARN', msg: 'OFF-CENTER',
              title: 'SHIFT LEFT',
              body: 'Move left so you\'re centered horizontally in the frame.' };
@@ -2195,32 +2274,29 @@ function maybeAutoDowngrade(tsMs) {
 }
 
 function visibilityOK(lm) {
-  // Image-space landmarks have a visibility field; worldLandmarks do too.
-  const checks = [LM.L_HIP, LM.R_HIP, LM.L_KNEE, LM.R_KNEE];
-  return checks.every(i => lm[i] && (lm[i].visibility ?? 0) > 0.5);
+  // Side-view friendly: at least one full leg (hip+knee on the same side) must
+  // be confidently visible. Requiring both sides breaks the documented setup.
+  return sideVisible(lm, LM.L_HIP, LM.L_KNEE) || sideVisible(lm, LM.R_HIP, LM.R_KNEE);
 }
 
-// Returns the average world-Y of the knees, in meters, with origin between hips.
-// Sign convention is data-driven (axisSign): if standing-tall y is positive → y-down convention
-// (knee is below hip in image, and worldLandmark agrees); if negative → y-up.
+// World-Y of knee/hip, in meters from mid-hip. Uses the more-visible side
+// (averaged only when both are confident) so an occluded far leg doesn't smear
+// the signal.
 function kneeYWorld(wlm) {
-  return avg(wlm[LM.L_KNEE].y, wlm[LM.R_KNEE].y);
+  return bestY(wlm, LM.L_KNEE, LM.R_KNEE);
 }
 function hipYWorld(wlm) {
-  return avg(wlm[LM.L_HIP].y, wlm[LM.R_HIP].y);
+  return bestY(wlm, LM.L_HIP, LM.R_HIP);
 }
 
 // "Depth" defined so that:
 //   positive = hip is above knee (standing)
 //   zero     = hip is level with knee (parallel squat)
 //   negative = hip is BELOW knee (HYROX legal)
-// We achieve this by axis-correcting the raw knee-y minus hip-y.
+// MediaPipe worldLandmarks are documented y-down (knee.y > hip.y when standing),
+// so the raw delta already has this convention. No axis inference needed.
 function computeDepth(wlm) {
-  const dy = kneeYWorld(wlm) - hipYWorld(wlm);
-  // y-down: standing dy > 0 (knee below hip in world) → axisSign = +1
-  // y-up:   standing dy < 0 → axisSign = -1
-  // After multiplying by axisSign, "depth" is always positive when standing.
-  return dy * calibration.axisSign;
+  return kneeYWorld(wlm) - hipYWorld(wlm);
 }
 
 // ============================
@@ -2286,7 +2362,31 @@ function calibrateLoop() {
           color: "#FFFFFF", fillColor: "#E84B1A", radius: 3, lineWidth: 1
         });
 
-        const frame = framingState(lm);
+        // Diagnostic dots over the landmarks calibration cares about: head,
+        // hips, knees, ankles. Green = confident, amber = marginal, red =
+        // missing. Lets the user see *which* joint the cal screen wants.
+        const DIAG_IDS = [0, LM.L_HIP, LM.R_HIP, LM.L_KNEE, LM.R_KNEE, LM.L_ANKLE, LM.R_ANKLE];
+        for (const i of DIAG_IDS) {
+          const p = lm[i];
+          if (!p) continue;
+          const v = p.visibility ?? 0;
+          const color = v >= 0.5 ? "#2DD4BF" : v >= 0.2 ? "#FBBF24" : "#F87171";
+          const cx = p.x * calOverlay.width;
+          const cy = p.y * calOverlay.height;
+          calCtx.save();
+          calCtx.fillStyle = color;
+          calCtx.strokeStyle = "rgba(0,0,0,0.75)";
+          calCtx.lineWidth = 2;
+          calCtx.beginPath();
+          calCtx.arc(cx, cy, 8, 0, Math.PI * 2);
+          calCtx.fill();
+          calCtx.stroke();
+          calCtx.restore();
+        }
+
+        // Calibration runs only for movements that need it (currently wall ball),
+        // which uses hip+knee only — head/ankle are nice-to-have, not required.
+        const frame = framingState(lm, { skipHeadAnkle: true });
         const isLocked = frame.state === 'LOCKED' && wlm;
 
         if (isLocked) {
@@ -2361,16 +2461,22 @@ function finishCalibration() {
   const sorted = [...calSampleBuf].sort((a, b) => a - b);
   const median = sorted[Math.floor(sorted.length / 2)];
 
-  // Determine axis sign: when standing, knee is BELOW hip physically.
-  // If median (knee.y - hip.y) is positive → y-down convention → axisSign = +1
-  // If negative → y-up convention → axisSign = -1
-  const axisSign = median >= 0 ? 1 : -1;
-
-  // Standing depth (always positive after axis correction) in meters
+  // Standing depth as a positive magnitude in meters. Anything implausibly
+  // small (< 10 cm) means the athlete was leaning or only partly in frame —
+  // reject and ask for a retry instead of silently committing nonsense.
   const standingDepth = Math.abs(median);
+  if (standingDepth < 0.10) {
+    calQuality.innerHTML = "<span class='bad'>● POSE INCONSISTENT — TRY AGAIN</span>";
+    calInstrTitle.textContent = "TRY AGAIN";
+    calInstrBody.textContent = "Captured baseline is too small to be real. Step into a true side view, stand fully tall, hold still.";
+    calSampleBuf = [];
+    calStableMs = 0;
+    calStartMs = 0;
+    calProgress.style.width = "0%";
+    return;
+  }
 
-  calibration.standingKneeY = median;
-  calibration.axisSign = axisSign;
+  calibration.standingKneeY = standingDepth;
   calibration.ts = Date.now();
   persistActiveCalibration();
 
@@ -2411,9 +2517,12 @@ function setHUDState(s) {
 function updateStateMachine(lm, wlm) {
   if (!visibilityOK(lm) || !wlm) {
     session.noVisFrames++;
-    if (session.noVisFrames > VIS_RESET_FRAMES && session.repActive) {
+    // Only abandon a rep on long vis loss AND no depth proven yet. If the
+    // athlete already hit depth, hold the rep open — the rep will be committed
+    // (valid) when vis returns and they're standing again. This stops legit
+    // reps from being silently dropped when arms cross the hip on the throw.
+    if (session.noVisFrames > VIS_RESET_FRAMES && session.repActive && !session.achievedDepth) {
       session.repActive = false;
-      session.achievedDepth = false;
       session.peakKneeY = null;
     }
     setHUDState(STATE.WAIT);
@@ -2499,6 +2608,7 @@ function updateStateMachine(lm, wlm) {
       }
       session.repActive = false;
       session.achievedDepth = false;
+      session.wasAscending = false;
       session.peakKneeY = null;
     }
     setHUDState(STATE.STAND);
@@ -2511,6 +2621,7 @@ function updateStateMachine(lm, wlm) {
         session.repActive = true;
         session.repStartTime = performance.now();
         session.achievedDepth = false;
+        session.wasAscending = false;
         session.peakKneeY = ctx.signal;
       }
     } else {
@@ -2519,6 +2630,28 @@ function updateStateMachine(lm, wlm) {
         session.peakKneeY = ctx.signal;
       }
       if (isAtDepth) session.achievedDepth = true;
+
+      // Ascent-peak commit. A fatigued athlete may never return to standThresh
+      // between reps, so the "isStanding && !movingDown" branch above never
+      // fires. Instead, when we see clear ascent (vel > 2× dz) and then ascent
+      // stalls (vel falls below half dz), commit the rep on its own merits.
+      // Requires achievedDepth so partial reps still register as no-reps via
+      // the standing branch when the athlete eventually stands up.
+      const ascentVel = dz * 2;
+      if (smoothed.velocity > ascentVel) session.wasAscending = true;
+      if (session.wasAscending && session.achievedDepth &&
+          smoothed.velocity < dz * 0.5) {
+        const duration = performance.now() - session.repStartTime;
+        if (duration >= MIN_REP_DURATION_MS) {
+          registerValidRep(session.peakKneeY);
+          session.repActive = false;
+          session.achievedDepth = false;
+          session.wasAscending = false;
+          session.peakKneeY = null;
+          setHUDState(STATE.STAND);
+          return;
+        }
+      }
     }
 
     if (isAtDepth)       setHUDState(STATE.DEPTH);
@@ -2572,6 +2705,7 @@ function resetSession() {
   session.repActive = false;
   session.repStartTime = 0;
   session.achievedDepth = false;
+  session.wasAscending = false;
   session.peakKneeY = null;
   session.noVisFrames = 0;
   smoothed.initialized = false;
@@ -2901,7 +3035,6 @@ $("calFlipBtn").addEventListener("click", flipCamera);
 // and lunge are unaffected (they use absolute angle thresholds).
 function skipCalibration() {
   calibration.standingKneeY = 0.30;  // default ~average adult hip-to-knee
-  calibration.axisSign = 1;          // MediaPipe worldLandmarks default convention
   calibration.ts = Date.now();
   if (activeAthlete) {
     activeAthlete.skippedCalibration = true;
@@ -3172,8 +3305,8 @@ loadAthletes();
 renderAthletes();
 // Initialize slider value displays
 depthValue.textContent = (settings.depthOffsetCm > 0 ? "+" : "") + settings.depthOffsetCm + " cm";
-standValue.textContent = (settings.standPct * 100) + "%";
-deadValue.textContent  = (settings.deadZoneMs * 100) + " cm/s";
+standValue.textContent = Math.round(settings.standPct * 100) + "%";
+deadValue.textContent  = Math.round(settings.deadZoneMs * 100) + " cm/s";
 
 </script>
 
