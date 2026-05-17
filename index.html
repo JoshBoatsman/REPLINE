@@ -1923,8 +1923,13 @@ async function loadModel(variant = currentModelVariant) {
     try { poseLandmarker.close(); } catch (e) {}
     poseLandmarker = null;
   }
+  // CPU delegate. iOS Safari's WebGL-backed GPU delegate has a long-running
+  // bug where PoseLandmarker returns valid landmark coordinates but with
+  // visibility=0 across all 33 joints — looks like a detection from the
+  // outside but is unusable. CPU is plenty fast on modern iPhones and the
+  // Full→Lite auto-downgrade still kicks in if needed.
   poseLandmarker = await PoseLandmarker.createFromOptions(visionFileset, {
-    baseOptions: { modelAssetPath: MODEL_URLS[variant], delegate: "GPU" },
+    baseOptions: { modelAssetPath: MODEL_URLS[variant], delegate: "CPU" },
     runningMode: "VIDEO",
     numPoses: 1,
     minPoseDetectionConfidence: 0.5,
