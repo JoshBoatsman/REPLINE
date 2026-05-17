@@ -2170,14 +2170,19 @@ function framingState(lm, opts = {}) {
              debug: { h: 0, cx: 0.5, vLH: 0, vRH: 0, vLK: 0, vRK: 0 } };
   }
   const v = (i) => (lm[i]?.visibility ?? 0);
-  const headVis    = v(0) > 0.4;
+  // 0.3 floor matches MediaPipe's typical inference-confidence range for the
+  // occluded far side in a true side view. 0.4 was rejecting partial-vis
+  // landmarks that were still positioned correctly, leaving cal stuck on
+  // "POSE INCOMPLETE" even when the model had a usable read on the body.
+  const VIS_MIN = 0.3;
+  const headVis    = v(0) > VIS_MIN;
   // Side view occludes one side of the body almost by definition. Require only
   // one hip + one knee (and let the same-side check enforce a usable leg).
-  const hipsVis    = v(23) > 0.4 || v(24) > 0.4;
-  const kneesVis   = v(25) > 0.4 || v(26) > 0.4;
-  const legVis     = sideVisible(lm, LM.L_HIP, LM.L_KNEE, 0.4) ||
-                     sideVisible(lm, LM.R_HIP, LM.R_KNEE, 0.4);
-  const anklesVis  = v(27) > 0.4 || v(28) > 0.4;
+  const hipsVis    = v(23) > VIS_MIN || v(24) > VIS_MIN;
+  const kneesVis   = v(25) > VIS_MIN || v(26) > VIS_MIN;
+  const legVis     = sideVisible(lm, LM.L_HIP, LM.L_KNEE, VIS_MIN) ||
+                     sideVisible(lm, LM.R_HIP, LM.R_KNEE, VIS_MIN);
+  const anklesVis  = v(27) > VIS_MIN || v(28) > VIS_MIN;
 
   // Bounding box from visible landmarks (image-space, 0..1) — computed early
   // so it's available to every return path's debug readout.
